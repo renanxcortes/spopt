@@ -23,6 +23,7 @@ Model based approaches for aggregating a large set of geographic units (with sma
     region.extract_clusters
     region.Skater
     region.Spenc
+    region.Spire
     region.WardSpatial
 
 Locate Methods

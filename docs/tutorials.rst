@@ -9,6 +9,7 @@ Tutorials
     notebooks/azp.ipynb
     notebooks/sa3.ipynb
     notebooks/skater.ipynb
+    notebooks/spire.ipynb
     notebooks/ward.ipynb
     notebooks/reg-k-means.ipynb
     notebooks/randomregion.ipynb
