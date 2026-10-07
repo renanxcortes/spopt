@@ -8,6 +8,7 @@ import pytest
 from scipy import sparse
 from scipy.optimize import OptimizeWarning
 from scipy.sparse import csgraph
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
@@ -19,6 +20,7 @@ from spopt.region.spire import (
     _best_split,
     _edge_dissimilarities,
     _local_predictions,
+    _neighborhoods,
     _reference_sample,
     _sequential_cuts,
     _tree_preorder,
@@ -112,15 +114,74 @@ class TestReferenceSample:
         assert ref.shape == (2, 2)
 
 
+class FitFailsRegressor(RegressorMixin, BaseEstimator):
+    """Raises if fitted, to prove a check ran before any local model was fit."""
+
+    def fit(self, X, y):  # noqa: ARG002, N803
+        raise RuntimeError("local model was fitted")
+
+    def predict(self, X):  # noqa: ARG002, N803
+        raise RuntimeError("local model was used")
+
+
+def two_chains(n_first, n_second):
+    """Adjacency of two disconnected chains (an island next to a mainland)."""
+    first = libpysal.weights.lat2W(1, n_first).sparse
+    second = libpysal.weights.lat2W(1, n_second).sparse
+    return sparse.block_diag([first, second]).tocsr()
+
+
+class TestNeighborhoods:
+    def test_fixed_order_members(self):
+        A = libpysal.weights.lat2W(1, 5).sparse
+        members, orders = _neighborhoods(
+            A, 2, min_size=1, adaptive=False, n_predictors=1
+        )
+        assert [sorted(m.tolist()) for m in members] == [
+            [0, 1, 2],
+            [0, 1, 2, 3],
+            [0, 1, 2, 3, 4],
+            [1, 2, 3, 4],
+            [2, 3, 4],
+        ]
+        assert orders.tolist() == [2, 2, 2, 2, 2]
+
+    def test_small_neighborhood_raises_and_suggests_adaptive(self):
+        A = libpysal.weights.lat2W(1, 5).sparse
+        with pytest.raises(ValueError, match="adaptive_neighborhoods=True") as error:
+            _neighborhoods(A, 1, min_size=3, adaptive=False, n_predictors=1)
+        message = str(error.value)
+        assert "2 of 5 areas" in message
+        assert "`min_neighborhood` (3)" in message
+        assert "smallest has 2 areas" in message
+
+    def test_adaptive_grows_only_small_neighborhoods(self):
+        A = libpysal.weights.lat2W(1, 5).sparse
+        members, orders = _neighborhoods(
+            A, 1, min_size=3, adaptive=True, n_predictors=1
+        )
+        assert orders.tolist() == [2, 1, 1, 1, 2]
+        assert sorted(members[0].tolist()) == [0, 1, 2]
+        assert sorted(members[2].tolist()) == [1, 2, 3]
+        assert sorted(members[4].tolist()) == [2, 3, 4]
+
+    def test_adaptive_cannot_grow_past_a_small_island(self):
+        A = two_chains(3, 10)
+        with pytest.raises(ValueError, match="connected components with fewer"):
+            _neighborhoods(A, 1, min_size=4, adaptive=True, n_predictors=1)
+
+
 class TestLocalPredictions:
-    def test_neighborhood_order_controls_training_rows(self):
+    def test_models_are_fit_on_given_members(self):
         # chain 0-1-2-3-4 with y = index; a mean model reveals the training rows
         A = libpysal.weights.lat2W(1, 5).sparse
         X = numpy.zeros((5, 1))
         y = numpy.arange(5, dtype=float)
         ref = numpy.zeros((3, 1))
-        P1 = _local_predictions(A, X, y, DummyRegressor(), 1, ref)
-        P2 = _local_predictions(A, X, y, DummyRegressor(), 2, ref)
+        members1, _ = _neighborhoods(A, 1, min_size=1, adaptive=False, n_predictors=1)
+        members2, _ = _neighborhoods(A, 2, min_size=1, adaptive=False, n_predictors=1)
+        P1 = _local_predictions(members1, X, y, DummyRegressor(), ref)
+        P2 = _local_predictions(members2, X, y, DummyRegressor(), ref)
         assert P1.shape == (5, 3)
         numpy.testing.assert_allclose(P1[:, 0], [0.5, 1.0, 2.0, 3.0, 3.5])
         numpy.testing.assert_allclose(P2[:, 0], [1.0, 1.5, 2.0, 2.5, 3.0])
@@ -331,6 +392,7 @@ class TestSpire:
             floor=5,
             estimator=estimator,
             islands="ignore",
+            adaptive_neighborhoods=True,
         )
         model.solve()
         assert_valid_partition(model, w, max(4, n_components), floor=5)
@@ -349,6 +411,7 @@ class TestSpire:
             n_clusters=4,
             floor=5,
             islands="ignore",
+            adaptive_neighborhoods=True,
             random_state=RANDOM_STATE,
         )
         model.solve()
@@ -388,7 +451,14 @@ class TestSpire:
         labels = []
         for w in (forward, symmetric):
             model = Spire(
-                df, w, ["x"], "y", n_clusters=2, floor=5, estimator=LinearRegression()
+                df,
+                w,
+                ["x"],
+                "y",
+                n_clusters=2,
+                floor=5,
+                estimator=LinearRegression(),
+                min_neighborhood=3,
             )
             model.solve()
             labels.append(model.labels_)
@@ -413,8 +483,8 @@ class TestSpire:
     @pytest.mark.filterwarnings("ignore:The graph is disconnected")
     def test_mexico_snapshot(self):
         # a linear model keeps the snapshot independent of tree tie-breaking
-        expected = [0, 0, 0, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 3, 3, 2]
-        expected += [3, 1, 2, 3, 3, 3, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2]
+        expected = [0, 0, 0, 1, 2, 1, 1, 2, 1, 1, 1, 1, 2, 3, 3, 2]
+        expected += [3, 1, 2, 2, 3, 3, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2]
         w = libpysal.weights.Queen.from_dataframe(MEXICO, use_index=False)
         attrs = [f"PCGDP{year}" for year in range(1950, 2000, 10)]
         model = Spire(
@@ -425,6 +495,7 @@ class TestSpire:
             n_clusters=4,
             floor=5,
             islands="ignore",
+            adaptive_neighborhoods=True,
             estimator=LinearRegression(),
             random_state=RANDOM_STATE,
         )
@@ -442,10 +513,12 @@ class TestSpireIslands:
         )
         self.n_components, _ = csgraph.connected_components(self.w.sparse)
         self.args = (self.columbus, self.w, ["INC", "HOVAL"], "CRIME")
+        # islands are too small to grow neighborhoods to the default minimum
+        self.kwargs = {"estimator": LinearRegression(), "min_neighborhood": 5}
 
     def test_islands_increase(self):
         assert self.n_components > 1
-        model = Spire(*self.args, n_clusters=2, floor=5, estimator=LinearRegression())
+        model = Spire(*self.args, **self.kwargs, n_clusters=2, floor=5)
         with pytest.warns(OptimizeWarning, match="The graph is disconnected"):
             model.solve()
         assert_valid_partition(model, self.w, 2 + self.n_components, floor=5)
@@ -455,9 +528,9 @@ class TestSpireIslands:
         n_clusters = self.n_components + 1
         model = Spire(
             *self.args,
+            **self.kwargs,
             n_clusters=n_clusters,
             floor=5,
-            estimator=LinearRegression(),
             islands="ignore",
         )
         with pytest.warns(OptimizeWarning, match="The graph is disconnected"):
@@ -466,7 +539,7 @@ class TestSpireIslands:
 
     @pytest.mark.filterwarnings("ignore:The graph is disconnected")
     def test_island_smaller_than_floor_raises(self):
-        model = Spire(*self.args, n_clusters=2, floor=10)
+        model = Spire(*self.args, n_clusters=2, floor=10, min_neighborhood=5)
         with pytest.raises(ValueError, match="Islands must be larger than the floor"):
             model.solve()
 
@@ -489,3 +562,44 @@ class TestSpireReviewFixes:
         path = namespace["model"].objective_path_
         assert path.shape == (4,)
         assert numpy.all(numpy.diff(path) <= 0)
+
+
+class TestSpireNeighborhoodSize:
+    def setup_method(self):
+        # a 30-area chain: the two end areas have 3-area 2-hop neighborhoods
+        X, y = two_slopes(30, 15)
+        self.df = pandas.DataFrame({"x": X[:, 0], "y": y})
+        self.w = libpysal.weights.lat2W(1, 30)
+        self.args = (self.df, self.w, ["x"], "y")
+        self.kwargs = {"n_clusters": 2, "floor": 5, "estimator": LinearRegression()}
+
+    def test_default_minimum_is_two_per_parameter(self):
+        # one predictor -> 2 * (1 + 1) = 4 areas, so the 3-area ends fail
+        model = Spire(*self.args, **self.kwargs)
+        with pytest.raises(ValueError, match="adaptive_neighborhoods=True") as error:
+            model.solve()
+        assert "`min_neighborhood` (4)" in str(error.value)
+        assert "2 of 30 areas" in str(error.value)
+
+    def test_check_runs_before_any_local_model_is_fit(self):
+        kwargs = {**self.kwargs, "estimator": FitFailsRegressor()}
+        with pytest.raises(ValueError, match="adaptive_neighborhoods"):
+            Spire(*self.args, **kwargs).solve()
+
+    def test_adaptive_expands_only_small_neighborhoods(self):
+        model = Spire(*self.args, **self.kwargs, adaptive_neighborhoods=True)
+        model.solve()
+        expected = numpy.full(30, 2)
+        expected[[0, -1]] = 3
+        numpy.testing.assert_array_equal(model.neighborhood_orders_, expected)
+        assert adjusted_rand_score(numpy.arange(30) >= 15, model.labels_) == 1.0
+
+    def test_explicit_min_neighborhood_overrides_default(self):
+        model = Spire(*self.args, **self.kwargs, min_neighborhood=3)
+        model.solve()
+        assert (model.neighborhood_orders_ == 2).all()
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_invalid_min_neighborhood(self, value):
+        with pytest.raises(ValueError, match="min_neighborhood"):
+            Spire(*self.args, **self.kwargs, min_neighborhood=value)

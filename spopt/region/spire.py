@@ -33,11 +33,16 @@ def _reference_sample(X, n_reference, trim, rng):
     return candidates[idx]
 
 
-def _local_predictions(A, X, y, estimator, order, reference):
-    """Fit one model per area on its ``order``-hop neighborhood.
+def _neighborhoods(A, order, min_size, adaptive, n_predictors):
+    """Members of each area's local neighborhood, checked against ``min_size``.
 
-    Returns an ``(N, M)`` array with each local model's predictions on
-    ``reference``; the local models themselves are discarded.
+    Each neighborhood is the ``order``-hop neighborhood of the area, including the
+    area itself. If any has fewer than ``min_size`` areas, a ``ValueError`` is
+    raised unless ``adaptive``, in which case only those neighborhoods grow one hop
+    at a time until they reach ``min_size``.
+
+    Returns a list with the member indices of each area and an ``(N,)`` array with
+    the number of hops used for each area.
     """
     n = A.shape[0]
     step = sparse.csr_matrix((A + sparse.identity(n)) != 0, dtype=np.int32)
@@ -45,9 +50,63 @@ def _local_predictions(A, X, y, estimator, order, reference):
     for _ in range(order - 1):
         hood = sparse.csr_matrix(hood @ step)
         hood.data[:] = 1
-    predictions = np.empty((n, reference.shape[0]))
-    for i in range(n):
-        idx = hood.indices[hood.indptr[i] : hood.indptr[i + 1]]
+    members = [hood.indices[hood.indptr[i] : hood.indptr[i + 1]] for i in range(n)]
+    orders = np.full(n, order)
+    sizes = np.diff(hood.indptr)
+    small = np.flatnonzero(sizes < min_size)
+    if small.size == 0:
+        return members, orders
+
+    if not adaptive:
+        smallest = small[np.argmin(sizes[small])]
+        raise ValueError(
+            f"{small.size} of {n} areas have a {order}-hop neighborhood with fewer "
+            f"than `min_neighborhood` ({min_size}) areas; the smallest has "
+            f"{sizes[smallest]} areas (row {smallest}). Local models fitted on so "
+            "few areas are unreliable: with "
+            f"{n_predictors} predictor(s), a linear model needs at least "
+            f"{n_predictors + 1} observations and interpolates them exactly, and a "
+            "regression tree has too few observations to split, so the resulting "
+            "predictive dissimilarities are mostly noise. Set "
+            "`adaptive_neighborhoods=True` to grow each small neighborhood one hop "
+            "at a time until it has at least `min_neighborhood` areas, or increase "
+            "`neighborhood_order`, or lower `min_neighborhood`."
+        )
+
+    _, components = cg.connected_components(A, directed=False)
+    stranded = small[np.bincount(components)[components[small]] < min_size]
+    if stranded.size:
+        raise ValueError(
+            f"{stranded.size} areas belong to connected components with fewer than "
+            f"`min_neighborhood` ({min_size}) areas, so their neighborhoods cannot "
+            "grow large enough even with `adaptive_neighborhoods=True`. Drop these "
+            "islands from `gdf` and `w`, or lower `min_neighborhood`."
+        )
+
+    # grow only the rows of the small neighborhoods
+    frontier = sparse.csr_matrix(hood[small])
+    while small.size:
+        frontier = sparse.csr_matrix(frontier @ step)
+        frontier.data[:] = 1
+        orders[small] += 1
+        grown = np.diff(frontier.indptr) >= min_size
+        for row, area in zip(np.flatnonzero(grown), small[grown], strict=True):
+            members[area] = frontier.indices[
+                frontier.indptr[row] : frontier.indptr[row + 1]
+            ]
+        small = small[~grown]
+        frontier = sparse.csr_matrix(frontier[~grown])
+    return members, orders
+
+
+def _local_predictions(members, X, y, estimator, reference):
+    """Fit one model per area on the areas in ``members[i]``.
+
+    Returns an ``(N, M)`` array with each local model's predictions on
+    ``reference``; the local models themselves are discarded.
+    """
+    predictions = np.empty((len(members), reference.shape[0]))
+    for i, idx in enumerate(members):
         model = clone(estimator).fit(X[idx], y[idx])
         predictions[i] = model.predict(reference)
     return predictions
@@ -238,11 +297,28 @@ class Spire(BaseSpOptHeuristicSolver):
         ``random_state``. Local models are fitted on small neighborhoods
         (at most 13 areas for a 2-hop rook neighborhood on a regular grid), so
         they should hold several times ``min_samples_leaf`` areas: for sparse
-        contiguity, increase ``neighborhood_order`` or pass a less constrained
+        contiguity, increase ``neighborhood_order`` or ``min_neighborhood``
+        (with ``adaptive_neighborhoods=True``), or pass a less constrained
         estimator.
     neighborhood_order : int (default 2)
         Local models are fitted on the ``neighborhood_order``-hop neighborhood
         of each area, including the area itself.
+    adaptive_neighborhoods : bool (default False)
+        What to do when a local neighborhood has fewer than
+        ``min_neighborhood`` areas. If ``False``, ``solve`` raises a
+        ``ValueError`` before fitting any local model, because models fitted on
+        so few areas give unreliable predictions. If ``True``, each such
+        neighborhood grows one hop at a time until it reaches
+        ``min_neighborhood`` areas, while larger neighborhoods keep
+        ``neighborhood_order`` hops. An island smaller than
+        ``min_neighborhood`` raises a ``ValueError`` either way.
+    min_neighborhood : int (default None)
+        The minimum number of areas a local model is fitted on. ``None`` uses
+        ``2 * (p + 1)`` for ``p`` predictors: twice the number of parameters of
+        a linear model, the least that leaves it as many residual degrees of
+        freedom as parameters. This safeguard is added by spopt; it is not part
+        of SPiRe as published, which fits local models on fixed 2-hop
+        neighborhoods.
     n_reference : int (default 250)
         Size of the shared reference sample of predictor vectors.
     reference_trim : float (default 0.01)
@@ -274,6 +350,10 @@ class Spire(BaseSpOptHeuristicSolver):
         ``(L, N)`` nested partitions matching ``objective_path_``.
     regional_models_ : dict
         Fitted estimator for each region label in ``labels_``.
+    neighborhood_orders_ : numpy.array
+        ``(N,)`` number of hops of the neighborhood each local model was fitted
+        on; larger than ``neighborhood_order`` only for neighborhoods grown by
+        ``adaptive_neighborhoods``.
     reference_sample_ : numpy.array
         The ``(M, P)`` reference sample of predictors.
     edge_dissimilarity_ : scipy.sparse.csr_matrix
@@ -294,11 +374,13 @@ class Spire(BaseSpOptHeuristicSolver):
     >>> w = libpysal.weights.Queen.from_dataframe(columbus, use_index=False)
 
     With few areas per region, a linear model is a better regional model than
-    the default regression tree.
+    the default regression tree. One Columbus neighborhood has fewer than the
+    default ``min_neighborhood`` areas, so it is allowed to grow.
 
     >>> model = Spire(
     ...     columbus, w, ["INC", "HOVAL"], "CRIME",
-    ...     n_clusters=4, floor=8, estimator=LinearRegression(), random_state=0,
+    ...     n_clusters=4, floor=8, estimator=LinearRegression(),
+    ...     adaptive_neighborhoods=True, random_state=0,
     ... )
     >>> model.solve()
 
@@ -319,6 +401,8 @@ class Spire(BaseSpOptHeuristicSolver):
         floor=10,
         estimator=None,
         neighborhood_order=2,
+        adaptive_neighborhoods=False,
+        min_neighborhood=None,
         n_reference=250,
         reference_trim=0.01,
         islands="increase",
@@ -335,6 +419,8 @@ class Spire(BaseSpOptHeuristicSolver):
         self.floor = floor
         self.estimator = estimator
         self.neighborhood_order = neighborhood_order
+        self.adaptive_neighborhoods = adaptive_neighborhoods
+        self.min_neighborhood = min_neighborhood
         self.n_reference = n_reference
         self.reference_trim = reference_trim
         self.islands = islands
@@ -368,6 +454,8 @@ class Spire(BaseSpOptHeuristicSolver):
             )
         if self.neighborhood_order < 1:
             raise ValueError("`neighborhood_order` must be at least 1.")
+        if self.min_neighborhood is not None and self.min_neighborhood < 1:
+            raise ValueError("`min_neighborhood` must be at least 1 or None.")
         if self.n_reference < 1:
             raise ValueError("`n_reference` must be at least 1.")
         if not 0 <= self.reference_trim < 0.5:
@@ -434,12 +522,23 @@ class Spire(BaseSpOptHeuristicSolver):
         A = abs(self.w.sparse)
         A = sparse.csr_matrix((A + A.T) != 0, dtype=float)
 
+        n_predictors = X.shape[1]
+        if self.min_neighborhood is None:
+            min_neighborhood = 2 * (n_predictors + 1)
+        else:
+            min_neighborhood = self.min_neighborhood
+        members, self.neighborhood_orders_ = _neighborhoods(
+            A,
+            self.neighborhood_order,
+            min_neighborhood,
+            self.adaptive_neighborhoods,
+            n_predictors,
+        )
+
         self.reference_sample_ = _reference_sample(
             X, self.n_reference, self.reference_trim, rng
         )
-        P = _local_predictions(
-            A, X, y, estimator, self.neighborhood_order, self.reference_sample_
-        )
+        P = _local_predictions(members, X, y, estimator, self.reference_sample_)
         rows, cols, d = _edge_dissimilarities(A, P)
         both = (np.r_[rows, cols], np.r_[cols, rows])
         self.edge_dissimilarity_ = sparse.csr_matrix((np.r_[d, d], both), shape=(n, n))
